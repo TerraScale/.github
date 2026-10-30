@@ -1,0 +1,25 @@
+name: Shared command CI
+
+on:
+  workflow_call:
+    inputs:
+      command:
+        description: Existing repository checks to run from its checkout
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: Run repository checks
+        env:
+          CHECK_COMMAND: ${{ inputs.command }}
+        run: bash -euo pipefail -c "$CHECK_COMMAND"

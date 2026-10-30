@@ -1,0 +1,22 @@
+name: Shared result gate
+
+on:
+  workflow_call:
+    inputs:
+      result:
+        description: Required upstream job result
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Require upstream success
+        env:
+          CHECK_RESULT: ${{ inputs.result }}
+        run: test "$CHECK_RESULT" = success
