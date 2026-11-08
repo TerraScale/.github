@@ -4,7 +4,7 @@ Reusable workflows for the repositories that remain outside the monorepo.
 
 Call workflows from `TerraScale/.github/.github/workflows/<file>.yml` and pin
 each call to an immutable full 40-character commit SHA. Update that pin through
-the normal `ts-ship` process when adopting a shared workflow change.
+a normal push to `main` when adopting a shared workflow change.
 
 | Workflow | Existing checks |
 | --- | --- |
