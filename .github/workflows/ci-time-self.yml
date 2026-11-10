@@ -1,0 +1,11 @@
+name: CI time
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+permissions:
+  actions: read
+  issues: write
+jobs:
+  ci-time:
+    uses: ./.github/workflows/ci-time.yml

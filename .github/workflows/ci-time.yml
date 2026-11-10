@@ -1,0 +1,125 @@
+name: CI time
+
+on:
+  workflow_call:
+    inputs:
+      threshold-seconds:
+        description: Seconds a CI run may take beyond the baseline before it opens or updates an issue
+        type: number
+        default: 30
+      baseline-runs:
+        description: Earlier successful first-attempt runs with the same jobs whose median CI time is the baseline
+        type: number
+        default: 5
+      scan-limit:
+        description: Newest successful runs of the same workflow and event searched for those baseline runs
+        type: number
+        default: 25
+
+permissions: {}
+
+jobs:
+  compare:
+    if: >-
+      github.event_name == 'workflow_run'
+      && github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - name: Compare the CI time with the median of earlier runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
+          CREATED_AT: ${{ github.event.workflow_run.created_at }}
+          WORKFLOW_ID: ${{ github.event.workflow_run.workflow_id }}
+          EVENT: ${{ github.event.workflow_run.event }}
+          NAME: ${{ github.event.workflow_run.name }}
+          URL: ${{ github.event.workflow_run.html_url }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          THRESHOLD: ${{ inputs.threshold-seconds }}
+          N: ${{ inputs.baseline-runs }}
+          SCAN_LIMIT: ${{ inputs.scan-limit }}
+        run: |
+          set -euo pipefail
+          timing() {
+            gh api "repos/$GH_REPO/actions/runs/$1/jobs?filter=latest&per_page=100" | jq -c --arg created "$2" '
+              [.jobs[] | select(.conclusion != "skipped")] as $ran
+              | if $ran == [] or any($ran[]; .conclusion != "success") then null else {
+                  signature: ([$ran[].name] | sort | join(", ")),
+                  secs: (([$ran[].completed_at | fromdate] | max) - ($created | fromdate)),
+                  jobs: ($ran | map({key: .name, value: ((.completed_at | fromdate) - (.started_at | fromdate))}) | from_entries)
+                } end'
+          }
+          this=$(timing "$RUN_ID" "$CREATED_AT")
+          if [ "$this" = null ]; then
+            echo "not comparable: $URL has a job that neither succeeded nor was skipped, or no job that succeeded" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          signature=$(jq -r .signature <<< "$this")
+          filters=(-f status=success -f event="$EVENT" -f per_page="$SCAN_LIMIT" -f exclude_pull_requests=true)
+          if [ "$EVENT" != pull_request ]; then
+            filters+=(-f branch="$HEAD_BRANCH")
+          fi
+          runs=$(gh api --method GET "repos/$GH_REPO/actions/workflows/$WORKFLOW_ID/runs" "${filters[@]}" \
+            | jq -c --argjson number "$RUN_NUMBER" '[.workflow_runs[] | select(.run_attempt == 1 and .run_number < $number)]')
+          kept=""
+          count=0
+          while read -r id number created url; do
+            run=$(timing "$id" "$created" \
+              | jq -c --arg signature "$signature" --argjson number "$number" --arg url "$url" \
+                'select(.signature == $signature) | . + {number: $number, url: $url}')
+            if [ -n "$run" ]; then
+              kept+="$run"$'\n'
+              count=$((count + 1))
+              if (( count == N )); then
+                break
+              fi
+            fi
+          done < <(jq -r '.[] | "\(.id) \(.run_number) \(.created_at) \(.html_url)"' <<< "$runs")
+          if (( count < 3 )); then
+            printf 'no baseline yet: %s of the last %s runs ran the same jobs (%s)\n' "$count" "$SCAN_LIMIT" "$signature" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          result=$(jq -s --argjson this "$this" --argjson threshold "$THRESHOLD" --arg name "$NAME" --arg event "$EVENT" \
+            --arg url "$URL" --arg commit "${HEAD_SHA:0:7}" --arg branch "$HEAD_BRANCH" '
+            def median: sort | if length % 2 == 1 then .[length / 2 | floor] else (.[length / 2 - 1] + .[length / 2]) / 2 end;
+            . as $kept
+            | (map(.secs) | median) as $base
+            | ($this.secs - $base) as $diff
+            | ([
+                "\($name) (\($event)): this run \($this.secs)s, baseline \($base)s (median of \(length) runs), difference \($diff)s, threshold \($threshold)s",
+                "",
+                "Jobs: \($this.signature)",
+                "",
+                "| job | this run (s) | median (s) | change (s) |",
+                "| --- | ---: | ---: | ---: |",
+                ($this.jobs | to_entries | map(.key as $job | {$job, this: .value, median: ([$kept[].jobs[$job]] | median)} | .change = .this - .median)
+                  | sort_by(-.change)[] | "| \(.job) | \(.this) | \(.median) | \(.change) |"),
+                "",
+                "Baseline runs: \(map("[#\(.number)](\(.url)) \(.secs)s") | join(", "))"
+              ] | join("\n")) as $report
+            | {regressed: ($this.secs > $base + $threshold), report: $report,
+               body: "Run \($url) (commit \($commit), branch \($branch)) took \($this.secs)s, \($diff)s more than the median \($base)s of the previous \(length) successful runs with the same jobs (threshold \($threshold)s).\n\n\($report)\n\nInvestigate why and fix the cause. This check never blocks a merge."}' <<< "$kept")
+          jq -r .report <<< "$result" >> "$GITHUB_STEP_SUMMARY"
+          regressed=$(jq .regressed <<< "$result")
+          if [ "$regressed" != true ]; then
+            exit 0
+          fi
+          body="$RUNNER_TEMP/ci-time.md"
+          jq -r .body <<< "$result" > "$body"
+          title="CI time regression: $NAME ($EVENT)"
+          issue=$(gh api "repos/$GH_REPO/issues?state=open&labels=ci-time&per_page=100" \
+            | jq --arg title "$title" '[.[] | select((has("pull_request") | not) and .title == $title)][0].number // empty')
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body-file "$body"
+          else
+            gh label create ci-time --force --color FBCA04 --description "A CI run got more than 30 s slower"
+            gh issue create --title "$title" --label ci-time --body-file "$body"
+          fi
