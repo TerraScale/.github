@@ -12,7 +12,7 @@ on:
         type: number
         default: 5
       scan-limit:
-        description: Newest successful runs of the same workflow and event searched for those baseline runs
+        description: Newest successful runs of the same workflow and event read in one query to find those baseline runs
         type: number
         default: 25
 
@@ -49,19 +49,18 @@ jobs:
         run: |
           set -euo pipefail
           timing() {
-            gh api "repos/$GH_REPO/actions/runs/$1/jobs?filter=latest&per_page=100" | jq -c --arg created "$2" '
-              [.jobs[] | select(.conclusion != "skipped")] as $ran
+            jq -c '[.jobs[] | select(.conclusion != "skipped")] as $ran
               | [$ran[] | select(.conclusion == "success")] as $ok
-              | if $ok == [] then null else {
+              | select($ok != []) | {number, url,
                   signature: (if $ok == $ran then [$ran[].name] | sort | join(", ") else null end),
-                  secs: (([$ran[].completed_at | fromdate] | max) - ($created | fromdate)),
+                  secs: (([$ran[].completed_at | fromdate] | max) - (.created | fromdate)),
                   jobs: ($ok | map({key: .name, value: {
                     secs: ((.completed_at | fromdate) - (.started_at | fromdate)),
-                    queued: ((.started_at | fromdate) - (.created_at | fromdate))}}) | from_entries)
-                } end'
+                    queued: (if .created_at then (.started_at | fromdate) - (.created_at | fromdate) else null end)}}) | from_entries)}'
           }
-          this=$(timing "$RUN_ID" "$CREATED_AT")
-          if [ "$this" = null ]; then
+          this=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" \
+            | jq -c --arg created "$CREATED_AT" '{created: $created, jobs}' | timing)
+          if [ -z "$this" ]; then
             echo "not comparable: no job of $URL succeeded" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
@@ -70,16 +69,13 @@ jobs:
             filters+=(-f branch="$HEAD_BRANCH")
           fi
           runs=$(gh api --method GET "repos/$GH_REPO/actions/workflows/$WORKFLOW_ID/runs" "${filters[@]}" \
-            | jq -c --argjson number "$RUN_NUMBER" '[.workflow_runs[] | select(.run_attempt == 1 and .run_number < $number)]')
-          kept=""
-          while read -r id number created url; do
-            kept+=$(timing "$id" "$created" | jq -c --argjson number "$number" --arg url "$url" 'select(.) | . + {number: $number, url: $url}')$'\n'
-            if jq -se --argjson this "$this" --argjson n "$N" '. as $kept
-              | ($this.signature == null or ([.[] | select(.signature == $this.signature)] | length) >= $n)
-                and all($this.jobs | keys[]; . as $job | [$kept[] | select(.jobs[$job])] | length >= $n)' <<< "$kept" > /dev/null; then
-              break
-            fi
-          done < <(jq -r '.[] | "\(.id) \(.run_number) \(.created_at) \(.html_url)"' <<< "$runs")
+            | jq -c --argjson number "$RUN_NUMBER" '[.workflow_runs[] | select(.run_attempt == 1 and .run_number < $number)
+                | {number: .run_number, url: .html_url, created: .created_at, suite: .check_suite_node_id}]')
+          kept=$(jq -c '{query: "query($ids: [ID!]!) { nodes(ids: $ids) { ... on CheckSuite { checkRuns(first: 100, filterBy: {checkType: ALL}) {
+                nodes { name conclusion started_at: startedAt completed_at: completedAt } } } } }", variables: {ids: map(.suite)}}' <<< "$runs" \
+            | gh api graphql --input - \
+            | jq -c --argjson runs "$runs" '[$runs, .data.nodes] | transpose[] | .[0] + {jobs: (.[1].checkRuns.nodes | reverse | map(.conclusion |= ascii_downcase))}' \
+            | timing)
           result=$(jq -s --argjson this "$this" --argjson n "$N" --argjson scanned "$(jq length <<< "$runs")" \
             --argjson threshold "$THRESHOLD" --arg name "$NAME" --arg event "$EVENT" --arg url "$URL" \
             --arg commit "${HEAD_SHA:0:7}" --arg branch "$HEAD_BRANCH" '
@@ -127,6 +123,6 @@ jobs:
           if [ -n "$issue" ]; then
             gh issue comment "$issue" --body-file "$body"
           else
-            gh label create ci-time --force --color FBCA04 --description "A CI run got more than 30 s slower"
+            gh label create ci-time --force --color FBCA04 --description "A CI run or one of its jobs got slower than its earlier runs by more than the threshold"
             gh issue create --title "$title" --label ci-time --body-file "$body"
           fi
