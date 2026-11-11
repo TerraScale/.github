@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       threshold-seconds:
-        description: Seconds the working time may take beyond its baseline, and a job beyond the slowest of its earlier runs; an issue opens when a job is over this and the working time is over it too, or the run has no baseline yet
+        description: Seconds the working time may take beyond the median of its earlier runs, and a job beyond the slowest of its earlier runs; an issue opens when that slowness repeats on the next run with the same jobs
         type: number
         default: 30
       baseline-runs:
@@ -104,10 +104,19 @@ jobs:
             --argjson threshold "$THRESHOLD" --arg name "$NAME" --arg event "$EVENT" --arg url "$URL" \
             --arg commit "${HEAD_SHA:0:7}" --arg branch "$HEAD_BRANCH" '
             def median: sort | if length % 2 == 1 then .[length / 2 | floor] else (.[length / 2 - 1] + .[length / 2]) / 2 end;
+            def judged($run; $before):
+              [$before[] | select($run.signature != null and .signature == $run.signature)] as $same
+              | (if ($same | length) >= 3 then $same[:$n] | map(.secs) | median else null end) as $base
+              | ($base != null and $run.secs > $base + $threshold) as $runslow
+              | [$run.jobs | to_entries[] | .key as $job | [$before[].jobs[$job].secs | select(. != null)][:$n] as $secs
+                  | select(($secs | length) >= 3 and .value.secs > ($secs | max) + $threshold)] as $slow
+              | {slow: ($runslow or $slow != []), runslow: $runslow, base: $base, same: ($same | length), jobs: $slow};
             . as $kept
-            | [.[] | select($this.signature != null and .signature == $this.signature)][:$n] as $same
+            | judged($this; $kept) as $now
+            | ($kept[0] // null) as $prev
+            | (if $prev then judged($prev; $kept[1:]) else null end) as $again
+            | [$kept[] | select($this.signature != null and .signature == $this.signature)][:$n] as $same
             | (if ($same | length) >= 3 then $same | map(.secs) | median else null end) as $base
-            | ($base != null and $this.secs > $base + $threshold) as $runslow
             | [$this.jobs | to_entries[] | .key as $job | [$kept[].jobs[$job].secs | select(. != null)][:$n] as $secs
                 | {$job, queued: .value.queued, this: .value.secs, runs: ($secs | length)}
                 | if .runs >= 3 then .median = ($secs | median) | .slowest = ($secs | max) else . end] as $jobs
@@ -123,13 +132,15 @@ jobs:
                 ($jobs | sort_by(.slowest == null, ((.slowest // 0) - .this))[]
                   | "| \(.job) | \(.queued) | \(.this) | \(.median // "no baseline yet") | \(.slowest // "") | \(.runs) |"),
                 (if $base then "", "Runs with the same jobs, working time: \($same | map("[#\(.number)](\(.url)) \(.secs)s") | join(", "))" else empty end),
-                (if $runslow and $slow == [] then "", "within runner variance: the working time is over the threshold, and no job took longer than the slowest of its earlier runs by more than the threshold" else empty end)
+                (if $now.slow and ($again.slow | not) then "", "slower once (working \($this.secs)s, threshold \($threshold)s\($slow | map(", \(.job) \(.this)s vs slowest \(.slowest)s") | join(""))): reported if the next run with the same jobs is slow too" else empty end)
               ] | join("\n")) as $report
-            | {regressed: ($slow != [] and ($runslow or $base == null)), report: $report, body: ([
-                "Run \($url) (commit \($commit), branch \($branch)) took more than the threshold of \($threshold)s longer than its earlier runs:",
+            | {regressed: ($now.slow and ($again.slow // false)), report: $report, body: ([
+                "Run \($url) (commit \($commit), branch \($branch)) was slow for the second run in a row, by more than the threshold of \($threshold)s:",
                 "",
-                (if $runslow then "- the working time was \($this.secs)s, \($this.secs - $base)s more than the median \($base)s of the previous \($same | length) successful runs with the same jobs; the wall time was \($this.wall)s, so \($this.wall - $this.secs)s of it was waiting for a runner or a lock" else empty end),
+                (if $now.runslow then "- the working time was \($this.secs)s, \($this.secs - $base)s more than the median \($base)s of the previous \($same | length) successful runs with the same jobs; the wall time was \($this.wall)s, so \($this.wall - $this.secs)s of it was waiting for a runner or a lock" else empty end),
                 ($slow[] | "- job \(.job) took \(.this)s, \(.this - .slowest)s more than the slowest \(.slowest)s of the previous \(.runs) successful runs that ran it (median \(.median)s); it queued \(.queued)s before it started"),
+                (if $again.runslow then "- the run before it, [#\($prev.number)](\($prev.url)), had a working time of \($prev.secs)s, \($prev.secs - $again.base)s more than the median \($again.base)s of the \($again.same) runs before it" else empty end),
+                (if $again then $again.jobs[] | "- and its job \(.key) took \(.value.secs)s, over the slowest of the runs before it" else empty end),
                 "",
                 $report,
                 "",
