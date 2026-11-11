@@ -5,6 +5,7 @@ on:
     types: [completed]
 permissions:
   actions: read
+  checks: read
   issues: write
 jobs:
   ci-time:

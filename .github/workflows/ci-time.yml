@@ -28,6 +28,7 @@ jobs:
     timeout-minutes: 2
     permissions:
       actions: read
+      checks: read
       issues: write
     steps:
       - name: Compare the CI time of the run and of each job with earlier runs

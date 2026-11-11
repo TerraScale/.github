@@ -21,6 +21,7 @@ on:
     types: [completed]
 permissions:
   actions: read
+  checks: read
   issues: write
 jobs:
   ci-time:
@@ -28,9 +29,9 @@ jobs:
 ```
 
 `node.yml` requests only `contents: read`; `ci-time.yml` requests only
-`actions: read` and `issues: write`, which its caller must grant. Both use the
-caller's GitHub token and declare no secrets, so calls require no credentials;
-do not add `secrets: inherit`.
+`actions: read`, `checks: read` and `issues: write`, which its caller must
+grant. Both use the caller's GitHub token and declare no secrets, so calls
+require no credentials; do not add `secrets: inherit`.
 
 This repository's own CI only lints workflow syntax. Its actionlint v1.7.12
 download is verified against the pinned Linux amd64 archive SHA-256. Run the
@@ -103,6 +104,7 @@ on:
     types: [completed]
 permissions:
   actions: read
+  checks: read
   issues: write
 jobs:
   ci-time:
@@ -115,6 +117,8 @@ jobs:
 | `baseline-runs` | `5` | Earlier runs the run and each job are compared with. |
 | `scan-limit` | `25` | Newest successful runs of the workflow and event whose jobs the check reads, all in one GraphQL query, to find them. It never paginates. |
 
-The caller must grant `actions: read`, to read run and job times, and
-`issues: write`, to manage the `ci-time` label and open or comment on the
+The caller must grant `actions: read`, to read the run's own jobs and the list
+of earlier runs; `checks: read`, to read the jobs of those earlier runs in the
+GraphQL query, which a private repository answers only with this permission;
+and `issues: write`, to manage the `ci-time` label and open or comment on the
 issue. This repository runs the check on its own CI from `ci-time-self.yml`.
