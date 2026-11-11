@@ -54,13 +54,16 @@ jobs:
           set -euo pipefail
           timing() {
             jq -c '
-              def round: . + 0.5 | floor;
               def working($span):
-                reduce ($span | sort_by(.start)[]) as $v (
+                reduce ($span | sort_by([(.created // .start), .name])[]) as $v (
                   {path: {}};
-                  [$span[] | select(.name != $v.name and .end <= $v.start) | . as $parent
-                    | select(all($span[]; .name == $v.name or .name == $parent.name or .end <= $parent.end or .end > $v.start))] as $parents
-                  | .path[$v.name] = (([$parents[].name as $up | .path[$up]] | max) // 0) + $v.work
+                  (if $v.created == null then
+                      [$span[] | select(.name != $v.name and .end <= $v.start) | . as $parent
+                        | select(all($span[]; .name == $v.name or .name == $parent.name or .end <= $parent.end or .end > $v.start))]
+                    else
+                      [$span[] | select(.name != $v.name and .end != null and .end <= ($v.created + 1))]
+                    end) as $parents
+                  | .path[$v.name] = (([$parents[].name as $up | .path[$up] // 0] | max) // 0) + $v.work
                 )
                 | [.path[]] | max;
               [.jobs[] | select(.conclusion != "skipped" and .started_at != null and .completed_at != null)] as $ran
@@ -69,14 +72,15 @@ jobs:
               | [$ran[] | {name,
                   start: (.started_at | fromdate),
                   end: (.completed_at | fromdate),
-                  work: ((.completed_at | fromdate) - (.started_at | fromdate) | round)}] as $span
+                  created: (if .created_at then (.created_at | fromdate) else null end),
+                  work: ((.completed_at | fromdate) - (.started_at | fromdate))}] as $span
               | {number, url,
                   signature: (if $ok == $ran then [$ran[].name] | sort | join(", ") else null end),
-                  wall: ((([$span[].end] | max) - (.created | fromdate)) | round),
+                  wall: (([$span[].end] | max) - (.created | fromdate)),
                   secs: working($span),
                   jobs: ($ok | map({key: .name, value: {
-                    secs: ((.completed_at | fromdate) - (.started_at | fromdate) | round),
-                    queued: (if .created_at then ((.started_at | fromdate) - (.created_at | fromdate) | round) else null end)}}) | from_entries)}'
+                    secs: ((.completed_at | fromdate) - (.started_at | fromdate)),
+                    queued: (if .created_at then ((.started_at | fromdate) - (.created_at | fromdate)) else null end)}}) | from_entries)}'
           }
           this=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" \
             | jq -c --arg created "$CREATED_AT" '{created: $created, jobs}' | timing)
