@@ -29,9 +29,11 @@ jobs:
     permissions:
       actions: read
       checks: read
-      issues: write
+    outputs:
+      body: ${{ steps.compare.outputs.body }}
     steps:
       - name: Compare the CI time of the run and of each job with earlier runs
+        id: compare
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -116,8 +118,30 @@ jobs:
           if [ "$regressed" != true ]; then
             exit 0
           fi
+          jq -r '"body=\(.body | tojson)"' <<< "$result" >> "$GITHUB_OUTPUT"
+
+  report:
+    needs: compare
+    if: needs.compare.outputs.body != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      issues: write
+    concurrency:
+      group: ci-time-report-${{ github.event.workflow_run.workflow_id }}-${{ github.event.workflow_run.event }}
+      cancel-in-progress: false
+    steps:
+      - name: Open or update the CI time regression issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          NAME: ${{ github.event.workflow_run.name }}
+          EVENT: ${{ github.event.workflow_run.event }}
+          BODY: ${{ needs.compare.outputs.body }}
+        run: |
+          set -euo pipefail
           body="$RUNNER_TEMP/ci-time.md"
-          jq -r .body <<< "$result" > "$body"
+          jq -r . <<< "$BODY" > "$body"
           title="CI time regression: $NAME ($EVENT)"
           issue=$(gh api "repos/$GH_REPO/issues?state=open&labels=ci-time&per_page=100" \
             | jq --arg title "$title" '[.[] | select((has("pull_request") | not) and .title == $title)][0].number // empty')

@@ -8,30 +8,7 @@ a pull request when adopting a shared workflow change.
 
 | Workflow | Checks |
 | --- | --- |
-| `node.yml` | ts-status's exact Legacy scan, dependency audit, checks, tests, build, and npm cache restore/save policy. |
 | `ci-time.yml` | Runs after each CI run of the calling repository and opens or updates a `ci-time` issue when the run took more than 30 s (by default) longer than the median of earlier runs with the same jobs, or when a job took more than 30 s longer than the slowest of its earlier runs. Never blocks a merge; see [CI time](#ci-time). |
-
-For example, a repository calls `ci-time.yml` from a workflow of its own:
-
-```yaml
-name: CI time
-on:
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-permissions:
-  actions: read
-  checks: read
-  issues: write
-jobs:
-  ci-time:
-    uses: TerraScale/.github/.github/workflows/ci-time.yml@<full-40-character-commit-SHA>
-```
-
-`node.yml` requests only `contents: read`; `ci-time.yml` requests only
-`actions: read`, `checks: read` and `issues: write`, which its caller must
-grant. Both use the caller's GitHub token and declare no secrets, so calls
-require no credentials; do not add `secrets: inherit`.
 
 This repository's own CI only lints workflow syntax. Its actionlint v1.7.12
 download is verified against the pinned Linux amd64 archive SHA-256. Run the
@@ -90,8 +67,15 @@ issue while it is open. The issue or comment says which case happened, names
 each slow job with its time, its slowest and median earlier times and its
 queued seconds, and includes the job summary. Investigate it and fix the cause.
 
+The check runs as two jobs. `compare` measures the run and writes the job
+summary; only in those two cases does `report` start, to open the issue or
+comment on it. Only one `report` of the same workflow and event runs at a time,
+and GitHub keeps one more waiting and cancels it when a third arrives: three
+regressions that finish together end as one issue, one comment and one
+cancelled `report`, whose comparison stays in its job summary.
+
 The check never blocks a merge: it runs after CI has finished, in its own
-workflow; never make it a required check. It needs no secrets.
+workflow; never make it a required check.
 
 Add this caller workflow to each repository, with `workflows` naming its CI
 workflow:
@@ -117,8 +101,15 @@ jobs:
 | `baseline-runs` | `5` | Earlier runs the run and each job are compared with. |
 | `scan-limit` | `25` | Newest successful runs of the workflow and event whose jobs the check reads, all in one GraphQL query, to find them. It never paginates. |
 
-The caller must grant `actions: read`, to read the run's own jobs and the list
-of earlier runs; `checks: read`, to read the jobs of those earlier runs in the
-GraphQL query, which a private repository answers only with this permission;
-and `issues: write`, to manage the `ci-time` label and open or comment on the
-issue. This repository runs the check on its own CI from `ci-time-self.yml`.
+The caller must grant three permissions. `compare` requests `actions: read`,
+to read the run's own jobs and the list of earlier runs, and `checks: read`, to
+read the jobs of those earlier runs in the GraphQL query, which a private
+repository answers only with this permission; `report` requests
+`issues: write`, to manage the `ci-time` label and open or comment on the
+issue. A caller that leaves one out gets a run that fails at startup with no
+job started, and its run page shows "Invalid workflow file" with the job and
+the permission, for example
+`The nested job 'compare' is requesting 'checks: read', but is only allowed 'checks: none'.`
+The check uses the caller's GitHub token and declares no secrets; do not add
+`secrets: inherit`. This repository runs the check on its own CI from
+`ci-time-self.yml`.
