@@ -24,6 +24,7 @@ jobs:
       github.event_name == 'workflow_run'
       && github.event.workflow_run.conclusion == 'success'
       && github.event.workflow_run.run_attempt == 1
+      && github.event.workflow_run.head_repository.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     permissions:
@@ -72,7 +73,7 @@ jobs:
             filters+=(-f branch="$HEAD_BRANCH")
           fi
           runs=$(gh api --method GET "repos/$GH_REPO/actions/workflows/$WORKFLOW_ID/runs" "${filters[@]}" \
-            | jq -c --argjson number "$RUN_NUMBER" '[.workflow_runs[] | select(.run_attempt == 1 and .run_number < $number)
+            | jq -c --argjson number "$RUN_NUMBER" --arg repo "$GH_REPO" '[.workflow_runs[] | select(.run_attempt == 1 and .run_number < $number and .head_repository.full_name == $repo)
                 | {number: .run_number, url: .html_url, created: .created_at, suite: .check_suite_node_id}]')
           kept=$(jq -c '{query: "query($ids: [ID!]!) { nodes(ids: $ids) { ... on CheckSuite { checkRuns(first: 100, filterBy: {checkType: ALL}) {
                 nodes { name conclusion started_at: startedAt completed_at: completedAt } } } } }", variables: {ids: map(.suite)}}' <<< "$runs" \

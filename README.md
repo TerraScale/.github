@@ -24,8 +24,12 @@ mise exec actionlint@1.7.12 shellcheck@0.11.0 -- actionlint
 earlier runs of the same workflow. It runs in its own workflow after a CI run
 has completed, and only for a run that succeeded on its first attempt: failed,
 cancelled and re-run CI runs are never measured or used as history.
+A run whose head is in another repository, such as a pull request from a fork,
+is never measured or used as history either, because the fork decides the
+workflow file, the branch name and the job names.
 
-The earlier runs are the first-attempt runs among the `scan-limit` newest
+The earlier runs are the first-attempt runs whose head is in the repository
+among the `scan-limit` newest
 successful runs of the same workflow and event, newest first; for any event
 other than `pull_request` they must also be on the same branch. The check reads
 the jobs of all of them in one GraphQL query, so it makes at most two REST
