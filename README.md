@@ -75,10 +75,12 @@ than the median of its earlier runs, or when a job took more than
 `threshold-seconds` longer than the slowest of its own earlier runs. One slow
 run is not a regression: a slow runner or a slow download usually does not
 repeat, and a change that costs time does. The check opens or updates the issue
-only when the slowness repeats, this run slow and the newest earlier run with
-the same jobs slow by the same two tests against the runs before it. A run that
-is slow once writes "slower once (...): reported if the next run with the same
-jobs is slow too" in its job summary and opens nothing. A job is held to its
+only when the slowness repeats, this run slow and the previous run with the
+same jobs slow by the same two tests against the runs before both. A run of
+other jobs in between does not count, and a run with no earlier run of the same
+jobs is not a repeat. A run that is slow once writes "slower once (...):
+reported if the next run with the same jobs is slow too" in its job summary and
+opens nothing. A job is held to its
 slowest earlier run rather than their median so that the normal spread of one
 job from run to run does not count as slow. Waiting for a runner never does
 either, because that wait is not part of the working time and not part of a
@@ -87,7 +89,7 @@ issue `CI time regression: <workflow> (<event>)` with that label, or comments on
 that issue while it is open. The issue or comment gives the working time when
 the run has a baseline, how much of the wall time was waiting, each slow job
 with its time, its slowest and median earlier times and its queued seconds, and
-the earlier run that was slow too, and includes the job summary. Investigate it
+the previous run with the same jobs that was slow too, and includes the job summary. Investigate it
 and fix the cause.
 
 The check runs as two jobs. `compare` measures the run and writes the job
@@ -120,7 +122,7 @@ jobs:
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `threshold-seconds` | `30` | Seconds the working time may take beyond the median of its earlier runs, and a job beyond the slowest of its earlier runs. A run over either is slow, and an issue opens only when the next run with the same jobs is slow too. |
+| `threshold-seconds` | `30` | Seconds the working time may take beyond the median of its earlier runs, and a job beyond the slowest of its earlier runs. A run over either is slow, and an issue opens only when the previous run with the same jobs was slow too. |
 | `baseline-runs` | `5` | Earlier runs the working time and each job are compared with. |
 | `scan-limit` | `25` | Newest successful runs of the workflow and event whose jobs the check reads, all in one GraphQL query, to find them. It never paginates. |
 
