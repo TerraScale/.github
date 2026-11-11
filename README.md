@@ -8,34 +8,29 @@ a pull request when adopting a shared workflow change.
 
 | Workflow | Checks |
 | --- | --- |
-| `command.yml` | Required `command` string, run from the caller's checkout with `bash -euo pipefail`. Used for branch-action, homebrew-tap, and ts-resources. |
 | `node.yml` | ts-status's exact Legacy scan, dependency audit, checks, tests, build, and npm cache restore/save policy. |
-| `terraform.yml` | terraform-provider-terrascale's exact Legacy scan, Go and advisory caches, advisory checks, tests, build, and snapshot archive/checksum validation. Keeps `GOTOOLCHAIN: local`. |
-| `result.yml` | Required `result` string; succeeds only for `success`. Aggregates an existing upstream job without moving its checks. |
-| `ci-time.yml` | Runs after each CI run of the calling repository and opens or updates a `ci-time` issue when the run took more than 30 s (by default) longer than the median of earlier runs with the same jobs. Never blocks a merge; see [CI time](#ci-time). |
+| `ci-time.yml` | Runs after each CI run of the calling repository and opens or updates a `ci-time` issue when the run took more than 30 s (by default) longer than the median of earlier runs with the same jobs, or when a job took more than 30 s longer than the slowest of its earlier runs. Never blocks a merge; see [CI time](#ci-time). |
 
-For example, keep the caller's existing triggers, concurrency, permissions, and
-dependencies, and replace only its job implementation:
+For example, a repository calls `ci-time.yml` from a workflow of its own:
 
 ```yaml
+name: CI time
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+permissions:
+  actions: read
+  issues: write
 jobs:
-  test:
-    uses: TerraScale/.github/.github/workflows/command.yml@<full-40-character-commit-SHA>
-    with:
-      command: python3 scripts/check_resources.py
+  ci-time:
+    uses: TerraScale/.github/.github/workflows/ci-time.yml@<full-40-character-commit-SHA>
 ```
 
-The generic command receives the existing repository check script through the
-`CHECK_COMMAND` environment variable. A result gate receives the caller's
-upstream result through its `result` input; the caller retains the `needs` and
-`if` conditions that make failure, cancellation, and skipped jobs visible.
-
-Every reusable workflow except `ci-time.yml` requests only `contents: read`;
-`ci-time.yml` requests only `actions: read` and `issues: write`, which its
-caller must grant. They all use the caller's existing GitHub token and declare
-no secrets, so calls require no credentials; do not add `secrets: inherit`.
-Source checks and existing test policies stay exact. No TerraBase binary is
-downloaded or executed here.
+`node.yml` requests only `contents: read`; `ci-time.yml` requests only
+`actions: read` and `issues: write`, which its caller must grant. Both use the
+caller's GitHub token and declare no secrets, so calls require no credentials;
+do not add `secrets: inherit`.
 
 This repository's own CI only lints workflow syntax. Its actionlint v1.7.12
 download is verified against the pinned Linux amd64 archive SHA-256. Run the
