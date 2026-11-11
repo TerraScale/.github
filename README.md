@@ -21,6 +21,7 @@ on:
     types: [completed]
 permissions:
   actions: read
+  checks: read
   issues: write
 jobs:
   ci-time:
@@ -28,9 +29,9 @@ jobs:
 ```
 
 `node.yml` requests only `contents: read`; `ci-time.yml` requests only
-`actions: read` and `issues: write`, which its caller must grant. Both use the
-caller's GitHub token and declare no secrets, so calls require no credentials;
-do not add `secrets: inherit`.
+`actions: read`, `checks: read` and `issues: write`, which its caller must
+grant. Both use the caller's GitHub token and declare no secrets, so calls
+require no credentials; do not add `secrets: inherit`.
 
 This repository's own CI only lints workflow syntax. Its actionlint v1.7.12
 download is verified against the pinned Linux amd64 archive SHA-256. Run the
@@ -47,10 +48,12 @@ earlier runs of the same workflow. It runs in its own workflow after a CI run
 has completed, and only for a run that succeeded on its first attempt: failed,
 cancelled and re-run CI runs are never measured or used as history.
 
-The earlier runs are first-attempt runs searched among the `scan-limit` newest
+The earlier runs are the first-attempt runs among the `scan-limit` newest
 successful runs of the same workflow and event, newest first; for any event
-other than `pull_request` they must also be on the same branch. The search
-stops as soon as the run and every job have `baseline-runs` earlier runs.
+other than `pull_request` they must also be on the same branch. The check reads
+the jobs of all of them in one GraphQL query, so it makes at most two REST
+calls, for the run's own jobs and the list of earlier runs, and one GraphQL
+query, whatever `scan-limit` is, plus the calls that open or update the issue.
 
 A run's CI time is the time from its creation, queue included, until its last
 job completed. Path filters and matrices make runs of one workflow run
@@ -65,8 +68,7 @@ never measured.
 
 With fewer than 3 earlier runs, the run or the job has no baseline yet and the
 job summary says so. A run in which a job neither succeeded nor was skipped has
-no run baseline: the search then looks only for its jobs that succeeded, which
-are compared as usual.
+no run baseline; its jobs that succeeded are compared as usual.
 
 The job summary shows the run's CI time against its baseline and the
 threshold, then one row per job that succeeded: the seconds it was queued, its
@@ -102,6 +104,7 @@ on:
     types: [completed]
 permissions:
   actions: read
+  checks: read
   issues: write
 jobs:
   ci-time:
@@ -112,8 +115,10 @@ jobs:
 | --- | --- | --- |
 | `threshold-seconds` | `30` | Seconds the run may take beyond its baseline, or a job beyond the slowest of its earlier runs, before the issue opens or gets a comment. |
 | `baseline-runs` | `5` | Earlier runs the run and each job are compared with. |
-| `scan-limit` | `25` | Newest successful runs of the workflow and event searched for them. The check reads the jobs of each run it inspects, one API call each, stops once every comparison has `baseline-runs` earlier runs, and never paginates. |
+| `scan-limit` | `25` | Newest successful runs of the workflow and event whose jobs the check reads, all in one GraphQL query, to find them. It never paginates. |
 
-The caller must grant `actions: read`, to read run and job times, and
-`issues: write`, to manage the `ci-time` label and open or comment on the
+The caller must grant `actions: read`, to read the run's own jobs and the list
+of earlier runs; `checks: read`, to read the jobs of those earlier runs in the
+GraphQL query, which a private repository answers only with this permission;
+and `issues: write`, to manage the `ci-time` label and open or comment on the
 issue. This repository runs the check on its own CI from `ci-time-self.yml`.
