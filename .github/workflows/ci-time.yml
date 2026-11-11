@@ -4,11 +4,11 @@ on:
   workflow_call:
     inputs:
       threshold-seconds:
-        description: Seconds a CI run may take beyond the baseline before it opens or updates an issue
+        description: Seconds a CI run may take beyond its baseline, or a job beyond the slowest of its earlier runs, before it opens or updates an issue
         type: number
         default: 30
       baseline-runs:
-        description: Earlier successful first-attempt runs with the same jobs whose median CI time is the baseline
+        description: Earlier successful first-attempt runs that the run and each of its jobs are compared with
         type: number
         default: 5
       scan-limit:
@@ -30,7 +30,7 @@ jobs:
       actions: read
       issues: write
     steps:
-      - name: Compare the CI time with the median of earlier runs
+      - name: Compare the CI time of the run and of each job with earlier runs
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -51,18 +51,20 @@ jobs:
           timing() {
             gh api "repos/$GH_REPO/actions/runs/$1/jobs?filter=latest&per_page=100" | jq -c --arg created "$2" '
               [.jobs[] | select(.conclusion != "skipped")] as $ran
-              | if $ran == [] or any($ran[]; .conclusion != "success") then null else {
-                  signature: ([$ran[].name] | sort | join(", ")),
+              | [$ran[] | select(.conclusion == "success")] as $ok
+              | if $ok == [] then null else {
+                  signature: (if $ok == $ran then [$ran[].name] | sort | join(", ") else null end),
                   secs: (([$ran[].completed_at | fromdate] | max) - ($created | fromdate)),
-                  jobs: ($ran | map({key: .name, value: ((.completed_at | fromdate) - (.started_at | fromdate))}) | from_entries)
+                  jobs: ($ok | map({key: .name, value: {
+                    secs: ((.completed_at | fromdate) - (.started_at | fromdate)),
+                    queued: ((.started_at | fromdate) - (.created_at | fromdate))}}) | from_entries)
                 } end'
           }
           this=$(timing "$RUN_ID" "$CREATED_AT")
           if [ "$this" = null ]; then
-            echo "not comparable: $URL has a job that neither succeeded nor was skipped, or no job that succeeded" >> "$GITHUB_STEP_SUMMARY"
+            echo "not comparable: no job of $URL succeeded" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          signature=$(jq -r .signature <<< "$this")
           filters=(-f status=success -f event="$EVENT" -f per_page="$SCAN_LIMIT" -f exclude_pull_requests=true)
           if [ "$EVENT" != pull_request ]; then
             filters+=(-f branch="$HEAD_BRANCH")
@@ -70,43 +72,48 @@ jobs:
           runs=$(gh api --method GET "repos/$GH_REPO/actions/workflows/$WORKFLOW_ID/runs" "${filters[@]}" \
             | jq -c --argjson number "$RUN_NUMBER" '[.workflow_runs[] | select(.run_attempt == 1 and .run_number < $number)]')
           kept=""
-          count=0
           while read -r id number created url; do
-            run=$(timing "$id" "$created" \
-              | jq -c --arg signature "$signature" --argjson number "$number" --arg url "$url" \
-                'select(.signature == $signature) | . + {number: $number, url: $url}')
-            if [ -n "$run" ]; then
-              kept+="$run"$'\n'
-              count=$((count + 1))
-              if (( count == N )); then
-                break
-              fi
+            kept+=$(timing "$id" "$created" | jq -c --argjson number "$number" --arg url "$url" 'select(.) | . + {number: $number, url: $url}')$'\n'
+            if jq -se --argjson this "$this" --argjson n "$N" '. as $kept
+              | ($this.signature == null or ([.[] | select(.signature == $this.signature)] | length) >= $n)
+                and all($this.jobs | keys[]; . as $job | [$kept[] | select(.jobs[$job])] | length >= $n)' <<< "$kept" > /dev/null; then
+              break
             fi
           done < <(jq -r '.[] | "\(.id) \(.run_number) \(.created_at) \(.html_url)"' <<< "$runs")
-          if (( count < 3 )); then
-            printf 'no baseline yet: %s of the last %s runs ran the same jobs (%s)\n' "$count" "$SCAN_LIMIT" "$signature" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          result=$(jq -s --argjson this "$this" --argjson threshold "$THRESHOLD" --arg name "$NAME" --arg event "$EVENT" \
-            --arg url "$URL" --arg commit "${HEAD_SHA:0:7}" --arg branch "$HEAD_BRANCH" '
+          result=$(jq -s --argjson this "$this" --argjson n "$N" --argjson scanned "$(jq length <<< "$runs")" \
+            --argjson threshold "$THRESHOLD" --arg name "$NAME" --arg event "$EVENT" --arg url "$URL" \
+            --arg commit "${HEAD_SHA:0:7}" --arg branch "$HEAD_BRANCH" '
             def median: sort | if length % 2 == 1 then .[length / 2 | floor] else (.[length / 2 - 1] + .[length / 2]) / 2 end;
             . as $kept
-            | (map(.secs) | median) as $base
-            | ($this.secs - $base) as $diff
+            | [.[] | select($this.signature != null and .signature == $this.signature)][:$n] as $same
+            | (if ($same | length) >= 3 then $same | map(.secs) | median else null end) as $base
+            | ($base != null and $this.secs > $base + $threshold) as $runslow
+            | [$this.jobs | to_entries[] | .key as $job | [$kept[].jobs[$job].secs // empty][:$n] as $secs
+                | {$job, queued: .value.queued, this: .value.secs, runs: ($secs | length)}
+                | if .runs >= 3 then .median = ($secs | median) | .slowest = ($secs | max) else . end] as $jobs
+            | [$jobs[] | select(.slowest and .this > .slowest + $threshold)] as $slow
+            | (if $this.signature == null then "no run baseline: a job neither succeeded nor was skipped"
+               elif $base then "baseline \($base)s (median of \($same | length) runs with the same jobs), difference \($this.secs - $base)s"
+               else "no run baseline yet: \($same | length) of the \($scanned) earlier runs ran the same jobs" end) as $run
             | ([
-                "\($name) (\($event)): this run \($this.secs)s, baseline \($base)s (median of \(length) runs), difference \($diff)s, threshold \($threshold)s",
+                "\($name) (\($event)): this run \($this.secs)s, \($run), threshold \($threshold)s",
                 "",
-                "Jobs: \($this.signature)",
-                "",
-                "| job | this run (s) | median (s) | change (s) |",
-                "| --- | ---: | ---: | ---: |",
-                ($this.jobs | to_entries | map(.key as $job | {$job, this: .value, median: ([$kept[].jobs[$job]] | median)} | .change = .this - .median)
-                  | sort_by(-.change)[] | "| \(.job) | \(.this) | \(.median) | \(.change) |"),
-                "",
-                "Baseline runs: \(map("[#\(.number)](\(.url)) \(.secs)s") | join(", "))"
+                "| job | queued (s) | this run (s) | median (s) | slowest (s) | runs |",
+                "| --- | ---: | ---: | ---: | ---: | ---: |",
+                ($jobs | sort_by(.slowest == null, (.slowest // 0) - .this)[]
+                  | "| \(.job) | \(.queued) | \(.this) | \(.median // "no baseline yet") | \(.slowest // "") | \(.runs) |"),
+                (if $base then "", "Runs with the same jobs: \($same | map("[#\(.number)](\(.url)) \(.secs)s") | join(", "))" else empty end)
               ] | join("\n")) as $report
-            | {regressed: ($this.secs > $base + $threshold), report: $report,
-               body: "Run \($url) (commit \($commit), branch \($branch)) took \($this.secs)s, \($diff)s more than the median \($base)s of the previous \(length) successful runs with the same jobs (threshold \($threshold)s).\n\n\($report)\n\nInvestigate why and fix the cause. This check never blocks a merge."}' <<< "$kept")
+            | {regressed: ($runslow or $slow != []), report: $report, body: ([
+                "Run \($url) (commit \($commit), branch \($branch)) took more than the threshold of \($threshold)s longer than its earlier runs:",
+                "",
+                (if $runslow then "- the run took \($this.secs)s, \($this.secs - $base)s more than the median \($base)s of the previous \($same | length) successful runs with the same jobs" else empty end),
+                ($slow[] | "- job \(.job) took \(.this)s, \(.this - .slowest)s more than the slowest \(.slowest)s of the previous \(.runs) successful runs that ran it (median \(.median)s); it queued \(.queued)s before it started"),
+                "",
+                $report,
+                "",
+                "Investigate why and fix the cause. This check never blocks a merge."
+              ] | join("\n"))}' <<< "$kept")
           jq -r .report <<< "$result" >> "$GITHUB_STEP_SUMMARY"
           regressed=$(jq .regressed <<< "$result")
           if [ "$regressed" != true ]; then
