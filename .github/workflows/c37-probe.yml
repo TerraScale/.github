@@ -1,0 +1,32 @@
+name: C37 probe
+
+on: pull_request
+
+permissions: {}
+
+jobs:
+  actions-issues:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      actions: read
+      issues: write
+    steps:
+      - name: Probe the job token with the final query of ci-time.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "== rate_limit before"
+          gh api rate_limit --jq '{core: .resources.core, graphql: .resources.graphql}'
+          runs=$(gh api --method GET "repos/$GH_REPO/actions/workflows/ci.yml/runs" -f status=success -f event=push -f branch=main -f per_page=3 -f exclude_pull_requests=true \
+            --jq '[.workflow_runs[] | {number: .run_number, url: .html_url, created: .created_at, suite: .check_suite_node_id}]')
+          echo "runs: $runs"
+          echo "== final query of ci-time.yml"
+          kept=$(jq -c '{query: "query($ids: [ID!]!) { nodes(ids: $ids) { ... on CheckSuite { checkRuns(first: 100, filterBy: {checkType: ALL}) {
+                nodes { name conclusion started_at: startedAt completed_at: completedAt } } } } }", variables: {ids: map(.suite)}}' <<< "$runs" \
+            | gh api graphql --input -)
+          echo "exit $? $kept"
+          echo "== rate_limit after"
+          gh api rate_limit --jq '{core: .resources.core, graphql: .resources.graphql}'
