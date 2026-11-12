@@ -8,7 +8,7 @@ a pull request when adopting a shared workflow change.
 
 | Workflow | Checks |
 | --- | --- |
-| `ci-time.yml` | Runs after each CI run of the calling repository and opens or updates a `ci-time` issue when a run is slow for the second time in a row: its working time is more than 30 s (by default) over the median of its earlier runs, or a job is more than 30 s over the slowest of its own. Time spent waiting for a runner is not counted. Never blocks a merge; see [CI time](#ci-time). |
+| `ci-time.yml` | Runs after each CI run of the calling repository and opens or updates a `ci-time` issue when the same slow job, or the slow working time, repeats on the previous run with the same jobs. A run is slow when its working time is more than 30 s (by default) over the median of its earlier runs, or a job is more than 30 s over the slowest of its own. Time spent waiting for a runner is not counted. Never blocks a merge; see [CI time](#ci-time). |
 
 This repository's own CI only lints workflow syntax. Its actionlint v1.7.12
 download is verified against the pinned Linux amd64 archive SHA-256. Run the
@@ -75,8 +75,10 @@ than the median of its earlier runs, or when a job took more than
 `threshold-seconds` longer than the slowest of its own earlier runs. One slow
 run is not a regression: a slow runner or a slow download usually does not
 repeat, and a change that costs time does. The check opens or updates the issue
-only when the slowness repeats, this run slow and the previous run with the
-same jobs slow by the same two tests against the runs before both. A run of
+only when the same signal repeats on the previous run with the same jobs:
+the working time over on both runs, or the same job slow on both, each judged
+against the runs before both. Two different signals, a slow job on this run and
+a slow working time on the previous one, are not a repeat. A run of
 other jobs in between does not count, and a run with no earlier run of the same
 jobs is not a repeat. A run that is slow once writes "slower once (...):
 reported if the next run with the same jobs is slow too" in its job summary and
@@ -86,11 +88,10 @@ job from run to run does not count as slow. Waiting for a runner never does
 either, because that wait is not part of the working time and not part of a
 job's time. The check then creates or updates the `ci-time` label and opens the
 issue `CI time regression: <workflow> (<event>)` with that label, or comments on
-that issue while it is open. The issue or comment gives the working time when
-the run has a baseline, how much of the wall time was waiting, each slow job
-with its time, its slowest and median earlier times and its queued seconds, and
-the previous run with the same jobs that was slow too, and includes the job summary. Investigate it
-and fix the cause.
+that issue while it is open. The issue or comment names the repeated signal
+first, the same job slow on both runs or the working time over on both runs,
+then each slow job that did not repeat, and includes the job summary.
+Investigate it and fix the cause.
 
 The check runs as two jobs. `compare` measures the run and writes the job
 summary; `report` starts only when the issue opens, to open it or comment on
@@ -122,7 +123,7 @@ jobs:
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `threshold-seconds` | `30` | Seconds the working time may take beyond the median of its earlier runs, and a job beyond the slowest of its earlier runs. A run over either is slow, and an issue opens only when the previous run with the same jobs was slow too. |
+| `threshold-seconds` | `30` | Seconds the working time may take beyond the median of its earlier runs, and a job beyond the slowest of its earlier runs. A run over either is slow, and an issue opens only when the same slow job, or the slow working time, repeats on the previous run with the same jobs. |
 | `baseline-runs` | `5` | Earlier runs the working time and each job are compared with. |
 | `scan-limit` | `25` | Newest successful runs of the workflow and event whose jobs the check reads, all in one GraphQL query, to find them. It never paginates. |
 
