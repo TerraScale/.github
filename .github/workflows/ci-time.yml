@@ -4,11 +4,11 @@ on:
   workflow_call:
     inputs:
       threshold-seconds:
-        description: Seconds a CI run may take beyond its baseline, or a job beyond the slowest of its earlier runs, before it opens or updates an issue
+        description: Seconds the working time may take beyond the median of its earlier runs, and a job beyond the slowest of its earlier runs; an issue opens when that slowness repeats on the previous run with the same jobs
         type: number
         default: 30
       baseline-runs:
-        description: Earlier successful first-attempt runs that the run and each of its jobs are compared with
+        description: Earlier successful first-attempt runs that the working time and each job are compared with
         type: number
         default: 5
       scan-limit:
@@ -53,14 +53,34 @@ jobs:
         run: |
           set -euo pipefail
           timing() {
-            jq -c '[.jobs[] | select(.conclusion != "skipped")] as $ran
+            jq -c '
+              def working($span):
+                reduce ($span | sort_by([(.created // .start), .name])[]) as $v (
+                  {path: {}};
+                  (if $v.created == null then
+                      [$span[] | select(.name != $v.name and .end <= $v.start) | . as $parent
+                        | select(all($span[]; .name == $v.name or .name == $parent.name or .end <= $parent.end or .end > $v.start))]
+                    else
+                      [$span[] | select(.name != $v.name and .end != null and .end <= ($v.created + 1))]
+                    end) as $parents
+                  | .path[$v.name] = (([$parents[].name as $up | .path[$up] // 0] | max) // 0) + $v.work
+                )
+                | [.path[]] | max;
+              [.jobs[] | select(.conclusion != "skipped" and .started_at != null and .completed_at != null)] as $ran
               | [$ran[] | select(.conclusion == "success")] as $ok
-              | select($ok != []) | {number, url,
+              | select($ok != [])
+              | [$ran[] | {name,
+                  start: (.started_at | fromdate),
+                  end: (.completed_at | fromdate),
+                  created: (if .created_at then (.created_at | fromdate) else null end),
+                  work: ((.completed_at | fromdate) - (.started_at | fromdate))}] as $span
+              | {number, url,
                   signature: (if $ok == $ran then [$ran[].name] | sort | join(", ") else null end),
-                  secs: (([$ran[].completed_at | fromdate] | max) - (.created | fromdate)),
+                  wall: (([$span[].end] | max) - (.created | fromdate)),
+                  secs: working($span),
                   jobs: ($ok | map({key: .name, value: {
                     secs: ((.completed_at | fromdate) - (.started_at | fromdate)),
-                    queued: (if .created_at then (.started_at | fromdate) - (.created_at | fromdate) else null end)}}) | from_entries)}'
+                    queued: (if .created_at then ((.started_at | fromdate) - (.created_at | fromdate)) else null end)}}) | from_entries)}'
           }
           this=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" \
             | jq -c --arg created "$CREATED_AT" '{created: $created, jobs}' | timing)
@@ -84,31 +104,45 @@ jobs:
             --argjson threshold "$THRESHOLD" --arg name "$NAME" --arg event "$EVENT" --arg url "$URL" \
             --arg commit "${HEAD_SHA:0:7}" --arg branch "$HEAD_BRANCH" '
             def median: sort | if length % 2 == 1 then .[length / 2 | floor] else (.[length / 2 - 1] + .[length / 2]) / 2 end;
+            def judged($run; $before):
+              [$before[] | select($run.signature != null and .signature == $run.signature)] as $same
+              | (if ($same | length) >= 3 then $same[:$n] | map(.secs) | median else null end) as $base
+              | ($base != null and $run.secs > $base + $threshold) as $runslow
+              | [$run.jobs | to_entries[] | .key as $job | [$before[].jobs[$job].secs | select(. != null)][:$n] as $secs
+                  | select(($secs | length) >= 3 and .value.secs > ($secs | max) + $threshold)] as $slow
+              | {slow: ($runslow or $slow != []), runslow: $runslow, base: $base, same: ($same | length), jobs: $slow};
             . as $kept
-            | [.[] | select($this.signature != null and .signature == $this.signature)][:$n] as $same
+            | (if $this.signature == null then null else [$kept[] | select(.signature == $this.signature)][0] // null end) as $prev
+            | (if $prev then [$kept[] | select(.number < $prev.number)] else $kept end) as $before
+            | judged($this; $before) as $now
+            | (if $prev then judged($prev; $before) else null end) as $again
+            | [$before[] | select($this.signature != null and .signature == $this.signature)][:$n] as $same
             | (if ($same | length) >= 3 then $same | map(.secs) | median else null end) as $base
-            | ($base != null and $this.secs > $base + $threshold) as $runslow
-            | [$this.jobs | to_entries[] | .key as $job | [$kept[].jobs[$job].secs // empty][:$n] as $secs
+            | [$this.jobs | to_entries[] | .key as $job | [$before[].jobs[$job].secs | select(. != null)][:$n] as $secs
                 | {$job, queued: .value.queued, this: .value.secs, runs: ($secs | length)}
                 | if .runs >= 3 then .median = ($secs | median) | .slowest = ($secs | max) else . end] as $jobs
             | [$jobs[] | select(.slowest and .this > .slowest + $threshold)] as $slow
             | (if $this.signature == null then "no run baseline: a job neither succeeded nor was skipped"
-               elif $base then "baseline \($base)s (median of \($same | length) runs with the same jobs), difference \($this.secs - $base)s"
-               else "no run baseline yet: \($same | length) of the \($scanned) earlier runs ran the same jobs" end) as $run
+               elif $base then "working time \($this.secs)s, baseline \($base)s (median working time of \($same | length) runs with the same jobs), difference \($this.secs - $base)s, of which the wall time spent waiting was \($this.wall - $this.secs)s"
+               else "no run baseline yet: \($same | length) of the \($scanned) earlier runs ran the same jobs; of the wall time, \($this.wall - $this.secs)s was waiting" end) as $run
             | ([
-                "\($name) (\($event)): this run \($this.secs)s, \($run), threshold \($threshold)s",
+                "\($name) (\($event)): wall \($this.wall)s, working \($this.secs)s, waiting \($this.wall - $this.secs)s, \($run), threshold \($threshold)s",
                 "",
                 "| job | queued (s) | this run (s) | median (s) | slowest (s) | runs |",
                 "| --- | ---: | ---: | ---: | ---: | ---: |",
-                ($jobs | sort_by(.slowest == null, (.slowest // 0) - .this)[]
+                ($jobs | sort_by(.slowest == null, ((.slowest // 0) - .this))[]
                   | "| \(.job) | \(.queued) | \(.this) | \(.median // "no baseline yet") | \(.slowest // "") | \(.runs) |"),
-                (if $base then "", "Runs with the same jobs: \($same | map("[#\(.number)](\(.url)) \(.secs)s") | join(", "))" else empty end)
+                (if $base then "", "Runs with the same jobs, working time: \($same | map("[#\(.number)](\(.url)) \(.secs)s") | join(", "))" else empty end),
+                (if $prev then "", "Previous run with the same jobs: [#\($prev.number)](\($prev.url)) working \($prev.secs)s" else empty end),
+                (if $now.slow and ($again.slow | not) then "", "slower once (working \($this.secs)s, threshold \($threshold)s\($slow | map(", \(.job) \(.this)s vs slowest \(.slowest)s") | join(""))): reported if the next run with the same jobs is slow too" else empty end)
               ] | join("\n")) as $report
-            | {regressed: ($runslow or $slow != []), report: $report, body: ([
-                "Run \($url) (commit \($commit), branch \($branch)) took more than the threshold of \($threshold)s longer than its earlier runs:",
+            | {regressed: ($now.slow and ($again.slow // false)), report: $report, body: ([
+                "Run \($url) (commit \($commit), branch \($branch)) was slow for the second run in a row, by more than the threshold of \($threshold)s:",
                 "",
-                (if $runslow then "- the run took \($this.secs)s, \($this.secs - $base)s more than the median \($base)s of the previous \($same | length) successful runs with the same jobs" else empty end),
+                (if $now.runslow then "- the working time was \($this.secs)s, \($this.secs - $base)s more than the median \($base)s of the previous \($same | length) successful runs with the same jobs; the wall time was \($this.wall)s, so \($this.wall - $this.secs)s of it was waiting for a runner or a lock" else empty end),
                 ($slow[] | "- job \(.job) took \(.this)s, \(.this - .slowest)s more than the slowest \(.slowest)s of the previous \(.runs) successful runs that ran it (median \(.median)s); it queued \(.queued)s before it started"),
+                (if $again.runslow then "- the previous run with the same jobs, [#\($prev.number)](\($prev.url)), had a working time of \($prev.secs)s, \($prev.secs - $again.base)s more than the median \($again.base)s of the \($again.same) runs before both" else empty end),
+                (if $again then $again.jobs[] | "- and its job \(.key) took \(.value.secs)s, over the slowest of the runs before both" else empty end),
                 "",
                 $report,
                 "",
