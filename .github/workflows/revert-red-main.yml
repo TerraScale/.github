@@ -96,10 +96,14 @@ jobs:
               parent = commit['parents'][0]['sha']
               prior = pages(f"actions/workflows/{run['workflow_id']}/runs?event=push&head_sha={parent}&per_page=100", 'workflow_runs')
               prior = [item for item in prior if item['head_branch'] == default]
-              if any(item['conclusion'] == 'failure' for item in prior):
-                  report(f'Skipped: the previous commit `{parent}` already has a red run of the same workflow; the cause is older.')
+              if not prior:
+                  report(f'Skipped: the previous commit `{parent}` has no push run of the same workflow on `{default}`; no green baseline is established.')
                   return
-              report(f'Previous commit `{parent}`: {len(prior)} run(s), no recorded failure of the same workflow.')
+              baseline = max(prior, key=lambda item: (item['run_number'], item['id']))
+              if baseline['status'] != 'completed' or baseline['conclusion'] != 'success':
+                  report(f"Skipped: the previous commit `{parent}` has no established green baseline: latest run {baseline['html_url']} is {baseline['status']} / {baseline['conclusion'] or 'pending'}. Attribution is inconclusive; COS attention is required.")
+                  return
+              report(f"Previous commit `{parent}`: latest run {baseline['html_url']} completed successfully; green baseline established.")
               branch = f'revert/{sha[:7]}'
               existing = pages(f'pulls?state=all&head={repo.split("/")[0]}:{branch}&per_page=100')
               if existing:
@@ -138,8 +142,22 @@ jobs:
                       return 'runner lost: runner disconnect reported in the job log'
                   return None
 
-              reasons = [infrastructure(job) for job in failed]
-              for job, reason in zip(failed, reasons):
+              causes = []
+              for job in failed:
+                  failed_steps = [step for step in job.get('steps') or []
+                                  if step.get('conclusion') in ('failure', 'timed_out')]
+                  propagated = (job['conclusion'] == 'failure' and failed_steps
+                                and all(step['name'] == 'Check upstream results'
+                                        and step['conclusion'] == 'failure' for step in failed_steps))
+                  if propagated:
+                      report(f"- Ignored [{job['name']}]({job['html_url']}) for outage attribution: only the caller’s `Check upstream results` assertion failed; this reports a needs result, not an independent failure.")
+                  else:
+                      causes.append(job)
+              if not causes:
+                  report('Skipped: only upstream-result assertions failed; no independent failed job establishes a cause. COS attention is required.')
+                  return
+              reasons = [infrastructure(job) for job in causes]
+              for job, reason in zip(causes, reasons):
                   report(f"- Failed job [{job['name']}]({job['html_url']}): {reason or 'repository step failed; not classified as infrastructure'}.")
               if all(reasons):
                   command('gh', 'run', 'rerun', run_id, '--failed')
