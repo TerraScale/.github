@@ -60,15 +60,18 @@ jobs:
               return subprocess.run(args, cwd=cwd, input=payload, text=True,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout.strip()
 
+          def endpoint(path):
+              return f'repos/{repo}' + (f'/{path}' if path else '')
+
           def api(path, payload=None):
-              args = ['gh', 'api', f'repos/{repo}/{path}']
+              args = ['gh', 'api', endpoint(path)]
               if payload is not None:
                   args += ['--method', 'POST', '--input', '-']
               result = command(*args, payload=json.dumps(payload) if payload is not None else None)
               return json.loads(result) if result else None
 
           def pages(path, key=None):
-              result = json.loads(command('gh', 'api', '--paginate', '--slurp', f'repos/{repo}/{path}'))
+              result = json.loads(command('gh', 'api', '--paginate', '--slurp', endpoint(path)))
               return [item for page in result for item in (page[key] if key else page)]
 
           def decide():
@@ -135,7 +138,7 @@ jobs:
                   if job['conclusion'] == 'failure' and not failed_steps:
                       return 'runner lost: job failed without a reported failing step'
                   try:
-                      log = command('gh', 'api', f"repos/{repo}/actions/jobs/{job['id']}/logs")
+                      log = command('gh', 'api', endpoint(f"actions/jobs/{job['id']}/logs"))
                   except subprocess.CalledProcessError:
                       return None
                   if lost.search(log):
