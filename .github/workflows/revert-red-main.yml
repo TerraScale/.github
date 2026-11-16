@@ -1,0 +1,191 @@
+name: Revert red main
+
+on:
+  workflow_call:
+    inputs:
+      run-id:
+        description: Failed workflow_run id
+        required: true
+        type: string
+      head-sha:
+        description: Failed workflow_run head_sha
+        required: true
+        type: string
+      workflow-name:
+        description: Failed workflow_run name
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: revert-red-main-${{ inputs.head-sha }}
+  cancel-in-progress: false
+
+jobs:
+  revert:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Decide, revert and dispatch the PR gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.run-id }}
+          HEAD_SHA: ${{ inputs.head-sha }}
+          WORKFLOW_NAME: ${{ inputs.workflow-name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+          from pathlib import Path
+
+          repo = os.environ['GH_REPO']
+          sha = os.environ['HEAD_SHA']
+          run_id = os.environ['RUN_ID']
+          summary = Path(os.environ['GITHUB_STEP_SUMMARY'])
+
+          def report(message):
+              with summary.open('a') as output:
+                  output.write(message + '\n\n')
+
+          def command(*args, cwd=None, payload=None):
+              return subprocess.run(args, cwd=cwd, input=payload, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True).stdout.strip()
+
+          def api(path, payload=None):
+              args = ['gh', 'api', f'repos/{repo}/{path}']
+              if payload is not None:
+                  args += ['--method', 'POST', '--input', '-']
+              result = command(*args, payload=json.dumps(payload) if payload is not None else None)
+              return json.loads(result) if result else None
+
+          def pages(path, key=None):
+              result = json.loads(command('gh', 'api', '--paginate', '--slurp', f'repos/{repo}/{path}'))
+              return [item for page in result for item in (page[key] if key else page)]
+
+          def decide():
+              if not re.fullmatch(r'[0-9a-f]{40}', sha) or not run_id.isdigit():
+                  raise ValueError('Invalid run id or head sha')
+              run = api(f'actions/runs/{run_id}')
+              repository = api('')
+              default = repository['default_branch']
+              eligible = (run['event'] == 'push' and run['head_branch'] == default
+                          and run['conclusion'] == 'failure' and run['run_attempt'] == 1
+                          and run['head_sha'] == sha and run['name'] == os.environ['WORKFLOW_NAME']
+                          and run['head_repository']['full_name'] == repo)
+              if not eligible:
+                  report('Skipped: run is not a first-attempt failed push on this repository’s default branch matching the supplied inputs.')
+                  return
+              report(f"Failed run: [{run['name']}]({run['html_url']}) at `{sha}` on `{default}`.")
+              commit = api(f'commits/{sha}')
+              if len(commit['parents']) != 1:
+                  report('Skipped: expected a squash merge with exactly one parent.')
+                  return
+              message = commit['commit']['message']
+              if re.match(r'^revert\b', message, re.IGNORECASE) or re.search(r'^This reverts commit [0-9a-f]+', message, re.MULTILINE):
+                  report('Skipped: the failed commit is itself a revert.')
+                  return
+              parent = commit['parents'][0]['sha']
+              prior = pages(f"actions/workflows/{run['workflow_id']}/runs?event=push&head_sha={parent}&per_page=100", 'workflow_runs')
+              prior = [item for item in prior if item['head_branch'] == default]
+              if any(item['conclusion'] == 'failure' for item in prior):
+                  report(f'Skipped: the previous commit `{parent}` already has a red run of the same workflow; the cause is older.')
+                  return
+              report(f'Previous commit `{parent}`: {len(prior)} run(s), no recorded failure of the same workflow.')
+              branch = f'revert/{sha[:7]}'
+              existing = pages(f'pulls?state=all&head={repo.split("/")[0]}:{branch}&per_page=100')
+              if existing:
+                  report(f"Skipped: a revert PR for this commit already exists: {existing[0]['html_url']} ({existing[0]['state']}).")
+                  return
+              jobs = pages(f'actions/runs/{run_id}/attempts/1/jobs?per_page=100', 'jobs')
+              failed = [job for job in jobs if job['conclusion'] in ('failure', 'timed_out', 'startup_failure')]
+              if not failed:
+                  report('Skipped: the failed run exposes no failed jobs; there is no failure to attribute.')
+                  return
+              setup = re.compile(
+                  r'^(?:set up job|initialize containers|set up runner|complete job|post .+|'
+                  r'(?:run )?actions/(?:checkout|setup-[\w-]+|cache(?:/restore|/save)?)@\S+|'
+                  r'(?:run )?docker/(?:login-action|setup-buildx-action)@\S+|'
+                  r'check\s*out(?:\s.*)?|setup[-\s].+|set up .+|'
+                  r'(?:(?:restore|save) .*cache.*|cache(?:\s.*)?)|'
+                  r'(?:log ?in|login|pull) .*(?:registry|ghcr|docker hub).*)$', re.IGNORECASE)
+              lost = re.compile(r'(?:runner.*(?:lost communication|lost contact|disconnected)|'
+                                r'lost communication with (?:the )?(?:server|runner)|'
+                                r'runner.*(?:shutdown signal|unexpectedly stopped))', re.IGNORECASE)
+
+              def infrastructure(job):
+                  steps = job.get('steps') or []
+                  own = [step for step in steps if step['status'] != 'queued'
+                         and step.get('conclusion') != 'skipped' and not setup.fullmatch(step['name'])]
+                  if not own:
+                      return 'failed during runner/setup steps, before any repository step ran'
+                  failed_steps = [step for step in steps if step.get('conclusion') in ('failure', 'timed_out')]
+                  if job['conclusion'] == 'failure' and not failed_steps:
+                      return 'runner lost: job failed without a reported failing step'
+                  try:
+                      log = command('gh', 'api', f"repos/{repo}/actions/jobs/{job['id']}/logs")
+                  except subprocess.CalledProcessError:
+                      return None
+                  if lost.search(log):
+                      return 'runner lost: runner disconnect reported in the job log'
+                  return None
+
+              reasons = [infrastructure(job) for job in failed]
+              for job, reason in zip(failed, reasons):
+                  report(f"- Failed job [{job['name']}]({job['html_url']}): {reason or 'repository step failed; not classified as infrastructure'}.")
+              if all(reasons):
+                  command('gh', 'run', 'rerun', run_id, '--failed')
+                  report('Infrastructure outage: reran failed jobs once; no revert. Attempt 2 is ineligible for this workflow.')
+                  return
+              prs = pages(f'commits/{sha}/pulls?per_page=100')
+              original = next((pr for pr in prs if pr['merged_at'] and pr['merge_commit_sha'] == sha
+                               and pr['base']['ref'] == default), None)
+              if original is None:
+                  report('Skipped: no merged PR matches this squash commit on the default branch.')
+                  return
+              workflow = run['path']
+              if not re.fullmatch(r'\.github/workflows/[\w.-]+\.ya?ml', workflow):
+                  raise ValueError('Expected a repository CI workflow path')
+              title = f'Revert "{original["title"]}" (#{original["number"]}): main red at {sha[:7]}'
+              body = '\n'.join([
+                  f'Reverts #{original["number"]} (`{sha}`) because [{run["name"]}]({run["html_url"]}) failed on `{default}`.',
+                  '', 'Failed jobs:', *[f'- [{job["name"]}]({job["html_url"]})' for job in failed],
+                  '', f'cc @{original["user"]["login"]}', '',
+                  f'CI is dispatched on `{branch}` with `pr_gate: true`; publication must be disabled.',
+              ])
+              with tempfile.TemporaryDirectory(dir=os.environ['RUNNER_TEMP']) as checkout:
+                  command('git', 'init', '-q', checkout)
+                  def git(*args):
+                      return command('git', '-c', 'core.hooksPath=/dev/null', *args, cwd=checkout)
+                  command('gh', 'auth', 'setup-git')
+                  git('remote', 'add', 'origin', f'https://github.com/{repo}.git')
+                  git('fetch', '--no-tags', 'origin', f'refs/heads/{default}')
+                  git('merge-base', '--is-ancestor', sha, 'FETCH_HEAD')
+                  git('checkout', '-b', branch, 'FETCH_HEAD')
+                  git('config', 'user.name', 'github-actions[bot]')
+                  git('config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com')
+                  git('revert', '--no-edit', sha)
+                  head = git('rev-parse', 'HEAD')
+                  git('push', 'origin', f'HEAD:refs/heads/{branch}')
+              pr = api('pulls', {'title': title, 'head': branch, 'base': default, 'body': body})
+              report(f"Opened {pr['html_url']} at `{head}`; reverted `{sha}` on the latest default branch.")
+              api(f'actions/workflows/{workflow.rsplit("/", 1)[1]}/dispatches',
+                  {'ref': branch, 'inputs': {'pr_gate': 'true'}})
+              report(f'Dispatched `{workflow}` on `{branch}` with `pr_gate: true`; its all-green check must qualify this exact head without publication.')
+              command('gh', 'pr', 'merge', str(pr['number']), '--auto', '--squash', '--match-head-commit', head)
+              report('Squash auto-merge enabled for the revert PR.')
+
+          try:
+              decide()
+          except Exception as error:
+              report(f'Failed: {type(error).__name__}: {error}. No additional attempt or conflict resolution was made; operator attention is required.')
+              raise
+          PY
